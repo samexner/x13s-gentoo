@@ -1,0 +1,137 @@
+name: Download Kernel Patches
+
+on:
+  # Run manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      base_commit:
+        description: 'Base commit hash (leave empty to auto-detect latest tag)'
+        required: false
+        default: ''
+      branch:
+        description: 'Branch name'
+        required: false
+        default: 'lenovo-x13s-linux-6.19.y'
+      create_new_patchset:
+        description: 'Create new patchset directory (detects new point release)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+  # Scheduled run - runs weekly on Monday at 00:00 UTC
+  schedule:
+    - cron: '0 0 * * 1'
+  # Trigger on new tags in upstream (via repository dispatch or manual check)
+  repository_dispatch:
+    types: [upstream-tag-created]
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.check-tags.outputs.new_tag }}
+      current_tag: ${{ steps.check-tags.outputs.current_tag }}
+      has_new_release: ${{ steps.check-tags.outputs.has_new_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for new upstream tags
+        id: check-tags
+        run: |
+          # Clone upstream repo to check tags
+          git clone --depth=1 --branch lenovo-x13s-linux-6.19.y https://github.com/steev/linux.git upstream_check
+          cd upstream_check
+          git fetch --tags
+          
+          # Get latest tag
+          LATEST_TAG=$(git tag --list 'v6.19*' --sort=-version:refname | head -n1)
+          echo "Latest upstream tag: ${LATEST_TAG}"
+          echo "latest_tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+          
+          # Check if we have a stored current tag
+          CURRENT_TAG=""
+          if [ -f "../patches/.current_tag" ]; then
+            CURRENT_TAG=$(cat "../patches/.current_tag")
+          fi
+          echo "Current stored tag: ${CURRENT_TAG}"
+          echo "current_tag=${CURRENT_TAG}" >> $GITHUB_OUTPUT
+          
+          # Determine if there's a new release
+          if [ -n "${LATEST_TAG}" ] && [ "${LATEST_TAG}" != "${CURRENT_TAG}" ]; then
+            echo "New release detected!"
+            echo "has_new_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "No new release"
+            echo "has_new_release=false" >> $GITHUB_OUTPUT
+          fi
+
+  download-patches:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Determine patch output directory
+        id: patch-dir
+        run: |
+          if [ "${{ github.event.inputs.create_new_patchset }}" = "true" ] || [ "${{ needs.detect-changes.outputs.has_new_release }}" = "true" ]; then
+            # Create timestamped patchset directory for new point release
+            PATCHSET_DIR="patches/patchset-$(date +%Y%m%d-%H%M%S)"
+            echo "Creating new patchset: ${PATCHSET_DIR}"
+          else
+            PATCHSET_DIR="patches"
+          fi
+          echo "patch_dir=${PATCHSET_DIR}" >> $GITHUB_OUTPUT
+          mkdir -p "${PATCHSET_DIR}"
+
+      - name: Download patches
+        env:
+          BASE_COMMIT: ${{ github.event.inputs.base_commit }}
+          BRANCH: ${{ github.event.inputs.branch || 'lenovo-x13s-linux-6.19.y' }}
+          OUTPUT_DIR: ${{ steps.patch-dir.outputs.patch_dir }}
+        run: |
+          chmod +x scripts/download_patches.sh
+          ./scripts/download_patches.sh
+
+      - name: Store current tag for future comparison
+        if: ${{ needs.detect-changes.outputs.has_new_release == 'true' || github.event.inputs.create_new_patchset == 'true' }}
+        run: |
+          mkdir -p patches
+          echo "${{ needs.detect-changes.outputs.new_tag }}" > patches/.current_tag
+
+      - name: List generated patches
+        run: |
+          echo "Generated patches:"
+          ls -la "${{ steps.patch-dir.outputs.patch_dir }}/"
+
+      - name: Upload patches as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-patches-${{ github.run_number }}
+          path: ${{ steps.patch-dir.outputs.patch_dir }}/
+          retention-days: 30
+
+      - name: Commit and push patches
+        run: |
+          # Check if there are changes
+          if [ -n "$(git status --porcelain patches/)" ]; then
+            git add patches/
+            if [ "${{ steps.patch-dir.outputs.patch_dir }}" != "patches" ]; then
+              git commit -m "chore: create new patchset ${{ steps.patch-dir.outputs.patch_dir }} (upstream: ${{ needs.detect-changes.outputs.new_tag }})"
+            else
+              git commit -m "chore: update kernel patches $(date +%Y-%m-%d)"
+            fi
+            git push
+          else
+            echo "No patch changes to commit"
+          fi
